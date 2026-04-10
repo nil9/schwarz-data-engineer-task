@@ -9,9 +9,8 @@ The output file displays (product_1, product_2, num_baskets), representing the t
 
 The implementation utilizes a two-pass architecture:
 
-Split Pass: Generates all possible combinations of items purchased within the same basket.
-
-Reduce Pass: Aggregates and counts the occurrences of these pairs across the entire dataset.
+- **Split pass:** generates all item-pair combinations within each basket and routes them into partition files.
+- **Reduce pass:** aggregates and counts the occurrences of these pairs across all partitions.
 
 The algorithm is specifically designed for scalability, ensuring that the process executes successfully even when the input and output datasets are too large to fit in memory.
 
@@ -31,14 +30,20 @@ mv data_1.csv.gz input/
 python assignment1/split.py input/data_1.csv.gz /tmp/parts_1 4
 ```
 
-Expected summary: Done. baskets_processed=52392, pairs_emitted=263762, baskets_skipped=13139
+Expected summary:
+```
+Done. baskets_processed=52392, pairs_emitted=263762, baskets_skipped=13139
+```
 
 **3. Pass 2 — count co-occurrences.** Reads each partition file, counts the distinct pairs within it, and writes the final result to `/tmp/cooc_1.csv`.
 ```bash
 python assignment1/reduce.py /tmp/parts_1 /tmp/cooc_1.csv
 ```
 
-Expected summary: Done. partitions_processed=4, distinct_pairs=32628, total_occurrences=263762
+Expected summary:
+```
+Done. partitions_processed=4, distinct_pairs=32628, total_occurrences=263762
+```
 
 Note that `total_occurrences` from pass 2 equals `pairs_emitted` from pass 1 (263,762), confirming that every pair written by the splitter was counted by the reducer.
 
@@ -63,7 +68,7 @@ Three strategies were considered for partitioning the workload:
 ## Why the result is correct
 
 
-In this solution, product_ids in a basket are sorted before creating the item combination. This guarantees exactly one canonical form for each pair. For Example, {2,7} could generate two forms (2,7) and (7,2). Since the items are sorted before pair generation, the canonical form of {2,7} always generates only (2,7). After this, each pair is then partitioned **p1%N** where p1 is the smallest item, and N is the number of partitions. This ensures partition independence: since every pair with the same p1 and with a deterministic partition function always ends up in the same partition. Pass 2 can then independently count the number of pairs in each partition and concatenate across the partition to provide the global count. There is no need to merge counts across partitions. 
+In this solution, product_ids in a basket are sorted before creating the item combination. This guarantees exactly one canonical form for each pair. For example, {2,7} could generate two forms (2,7) and (7,2). Since the items are sorted before pair generation, the canonical form of {2,7} always generates only (2,7). After this, each pair is then partitioned **p1%N** where p1 is the smallest item, and N is the number of partitions. This ensures partition independence: since every pair with the same p1 and with a deterministic partition function always ends up in the same partition. Pass 2 can then independently count the number of pairs in each partition and concatenate across the partition to provide the global count. There is no need to merge counts across partitions. 
 
 ## Why it fits in memory
 
@@ -99,3 +104,41 @@ pytest tests/ -v
 - **`test_empty_input`** — verifies behavior with an empty input file (output contains only the header row).
 - **`test_all_singletons`** — ensures no output is produced when all baskets contain only a single product.
 - **`test_single_basket_four_products`** — checks correct pair generation and counting for a basket with multiple items.
+
+## Bonus
+
+### Skew on real-world data
+
+Correctness is not affected by data distribution. Partition independence depends on the partitioning function, not on how frequently pairs occur. Each pair always maps to the same partition, and Pass 2 processes partitions independently without cross-partition merging.
+
+However, performance and memory usage can degrade under skew. If certain products appear very frequently (e.g., bread or milk), many pairs involving those products may be routed to the same partition. This leads to imbalanced workloads, where one partition becomes significantly larger and may exceed memory limits, while others remain small.
+
+**Mitigations:**
+
+- **Hash both products** — Use `hash((p1, p2)) % N` instead of `p1 % N` to distribute pairs more evenly across partitions, even when some products are very frequent.
+- **Sub-partition heavy partitions** — Detect large partitions and split them further using a secondary key to reduce memory pressure.
+- **Adaptive strategies (advanced)** — In production, monitor partition sizes and dynamically rebalance when skew is detected.
+
+### Extension to triples
+
+If the requirement is to count both pairs and triples, the same overall approach can be extended naturally. For each basket, products are first sorted into a canonical order. The pipeline then generates:
+
+- all 2-product combinations `(p1, p2)`
+- all 3-product combinations `(p1, p2, p3)`
+
+For triples, the canonical form is `p1 < p2 < p3`. As with pairs, each combination is routed deterministically to a partition, ensuring that all occurrences of the same triple always end up in the same partition file.
+
+A practical implementation would still read the input only once. During Pass 1, each basket emits its pairs into one set of partition files and its triples into another. During Pass 2, these partition sets are processed independently, producing two outputs: one for pair counts and one for triple counts. Keeping them separate avoids mixing schemas and preserves the memory-efficient design.
+
+The main difference is cost. A basket with `k` products produces `C(k,2)` pairs and `C(k,3)` triples, increasing both intermediate data size and computation. The output space also grows significantly. For example, with 256 products there are:
+
+- `C(256,2) = 32,640` possible pairs
+- `C(256,3) = 2,763,520` possible triples
+
+This makes triple counting much more expensive in terms of runtime and memory.
+
+**Mitigations:**
+
+- **Increase partition count for triples** — use a larger `N` than for pairs to reduce per-partition memory usage.
+- **Stronger partitioning** — use a composite hash such as `hash((p1, p2)) % N` to better distribute combinations and reduce skew.
+- **Adaptive partitioning (advanced)** — monitor partition sizes during execution and detect skew (e.g., partitions significantly larger than average). Heavy partitions can then be rebalanced by sub-partitioning them using an additional deterministic key or by increasing partition granularity in subsequent runs. This keeps memory usage stable as data distribution evolves.
